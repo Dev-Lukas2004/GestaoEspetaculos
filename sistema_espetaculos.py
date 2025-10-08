@@ -11,7 +11,11 @@ import numpy as np
 import shutil
 from PIL import Image
 import threading
+import re
+import fitz  # PyMuPDF
 
+# Se o seu arquivo database.py estiver em outro lugar, ajuste o caminho.
+# Assumindo que está no mesmo diretório:
 from database import Database
 
 def resource_path(relative_path):
@@ -143,10 +147,220 @@ class App(ctk.CTk):
         if self.debounce_job:
             self.after_cancel(self.debounce_job)
         if self.filtro_nome.get().strip():
-             self.debounce_job = self.after(500, self.atualizar_historico)
+                self.debounce_job = self.after(500, self.atualizar_historico)
         else:
             self.limpar_resultados_historico()
+            
+    #======================================================================
+    #============== MÉTODOS DE IMPORTAÇÃO DE PDF (ATUALIZADO) ==============
+    #======================================================================
+    def importar_de_pdf(self):
+        """Abre o seletor de arquivos e inicia o processamento do PDF."""
+        caminho_pdf = filedialog.askopenfilename(
+            title="Selecione o arquivo PDF de Borderô",
+            filetypes=[("Arquivos PDF", "*.pdf")]
+        )
+        if not caminho_pdf:
+            return
 
+        try:
+            dados_extraidos = self._processar_pdf(caminho_pdf)
+            if not dados_extraidos or not dados_extraidos.get("sessoes"):
+                messagebox.showerror("Erro de Leitura", "Não foi possível extrair dados de sessões válidas do PDF. Verifique o formato do arquivo.")
+                return
+            
+            self.abrir_janela_confirmacao_pdf(dados_extraidos)
+
+        except Exception as e:
+            messagebox.showerror("Erro Inesperado", f"Ocorreu um erro ao processar o PDF: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _processar_pdf(self, caminho_pdf):
+        """Lê o texto do PDF e chama a função de extração."""
+        texto_completo = ""
+        with fitz.open(caminho_pdf) as doc:
+            for pagina in doc:
+                texto_completo += pagina.get_text("text")
+        
+        return self._extrair_dados_do_texto(texto_completo)
+
+    def _extrair_dados_do_texto(self, texto):
+        """
+        Extrai informações do PDF onde cada data é seguida por sua tabela de público.
+        Ajustado para o novo formato de borderô.
+        """
+        dados = {"sessoes": []}
+
+        # 1. Extrai informações globais que aparecem uma vez
+        match_evento = re.search(r"Evento:\s*([^\n\r]+)", texto, re.IGNORECASE)
+        if match_evento:
+            dados["nome_evento"] = match_evento.group(1).strip()
+
+        match_total = re.search(r"Total vendido no evento\s*\n\s*(\d+)", texto, re.IGNORECASE)
+        if match_total:
+            dados["total_vendido_pdf"] = int(match_total.group(1))
+        else:
+            dados["total_vendido_pdf"] = None
+
+        # 2. Divide o texto em blocos, cada um começando com "Data:"
+        # O re.split com `(?=...)` mantém o delimitador (a linha da data) no início de cada bloco
+        blocos = re.split(r"(?=Data:\s*\d{2}/\d{2}/\d{4})", texto, flags=re.IGNORECASE)
+
+        for bloco in blocos:
+            if not bloco.strip():
+                continue
+
+            # 3. Tenta extrair a data do início do bloco
+            match_data = re.search(r"Data:\s*(\d{2}/\d{2}/\d{4})", bloco, re.IGNORECASE)
+            if not match_data:
+                continue
+            
+            data_sessao = match_data.group(1)
+            
+            # 4. Processa a tabela de público dentro deste bloco
+            sessao_publico = {"pcg": 0, "com": 0, "adv": 0}
+            
+            # Padrão para encontrar os tipos de público e seus valores
+            padrao_publico = re.compile(
+                r"^(Comprometimento \(PCG\)|Cortesia PRODUÇÃO|Cortesia SESC|Inteira|Meia Entrada|Trabalhador)\s*\n\s*(\d+)", 
+                re.MULTILINE | re.IGNORECASE
+            )
+            
+            matches = padrao_publico.findall(bloco)
+
+            # Se não encontrou nenhuma linha de público, pula o bloco
+            if not matches:
+                continue
+
+            for tipo, valor_str in matches:
+                try:
+                    valor = int(valor_str)
+                    tipo_normalizado = tipo.lower()
+
+                    if "comprometimento (pcg)" in tipo_normalizado:
+                        sessao_publico["pcg"] += valor
+                    elif "trabalhador" in tipo_normalizado:
+                        sessao_publico["com"] += valor
+                    else:  # Cortesia, Inteira, Meia Entrada são agrupados em "adv"
+                        sessao_publico["adv"] += valor
+                except (ValueError, TypeError):
+                    # Ignora se o valor não for um número válido
+                    continue
+            
+            # 5. Adiciona a sessão se algum dado de público foi encontrado
+            if any(sessao_publico.values()):
+                dados["sessoes"].append({
+                    "data": data_sessao,
+                    "publico": sessao_publico
+                })
+
+        return dados
+
+    def abrir_janela_confirmacao_pdf(self, dados_extraidos):
+        win = ctk.CTkToplevel(self)
+        win.title("Confirmar Dados Importados do PDF")
+        win.geometry("800x600") 
+        win.transient(self)
+        win.grab_set()
+
+        nome_evento = dados_extraidos.get("nome_evento", "Nome não encontrado")
+        sessoes_encontradas = dados_extraidos.get("sessoes", [])
+
+        ctk.CTkLabel(win, text=f"Evento: {nome_evento}", font=self.FONTS["title"]).pack(pady=(10, 5))
+        ctk.CTkLabel(win, text=f"{len(sessoes_encontradas)} sessões com datas específicas foram encontradas.", 
+                           font=self.FONTS["body_bold"]).pack(pady=(0, 10))
+
+        total_calculado = sum(s['publico']['pcg'] + s['publico']['com'] + s['publico']['adv'] for s in sessoes_encontradas)
+        total_pdf = dados_extraidos.get("total_vendido_pdf")
+
+        validacao_frame = ctk.CTkFrame(win, corner_radius=8)
+        validacao_frame.pack(pady=10, padx=20, fill="x")
+        
+        status_text, status_color = "", ""
+        if total_pdf is None:
+            status_text = f"AVISO: O total geral não foi encontrado no PDF. (Total calculado: {total_calculado})"
+            status_color = "#D08770"
+            validacao_frame.configure(fg_color="#433E3B")
+        elif total_calculado == total_pdf:
+            status_text = f"✅ VALIDAÇÃO OK: Total calculado ({total_calculado}) bate com o total do PDF ({total_pdf})."
+            status_color = self.COLORS["primary"]
+            validacao_frame.configure(fg_color="#344944")
+        else:
+            status_text = f"⚠️ ATENÇÃO: Total calculado ({total_calculado}) NÃO BATE com o total do PDF ({total_pdf}). Verifique os dados."
+            status_color = self.COLORS["danger"]
+            validacao_frame.configure(fg_color="#4F3B3B")
+
+        ctk.CTkLabel(validacao_frame, text=status_text, font=self.FONTS["body_bold"], text_color=status_color).pack(pady=8, padx=10)
+
+        input_frame = ctk.CTkFrame(win, fg_color="transparent")
+        input_frame.pack(fill="x", padx=20, pady=10)
+
+        ctk.CTkLabel(input_frame, text="Selecione a Sala:", font=self.FONTS["header"]).pack(side="left", padx=(0, 10))
+        combo_sala = ctk.CTkComboBox(input_frame, values=["Arena", "Multiuso", "Mezanino"], font=self.FONTS["body"], state="readonly", width=150)
+        combo_sala.set("Selecione")
+        combo_sala.pack(side="left")
+
+        scroll_frame = ctk.CTkScrollableFrame(win, label_text="Sessões encontradas")
+        scroll_frame.pack(fill="both", expand=True, padx=20, pady=10)
+        
+        headers = ["Data da Sessão", "Público PCG", "Público Comerciário", "Público Adversos/Geral", "Total Dia"]
+        for i, h in enumerate(headers):
+            ctk.CTkLabel(scroll_frame, text=h, font=self.FONTS["header"]).grid(row=0, column=i, padx=10, pady=5)
+
+        for idx, sessao_data in enumerate(sessoes_encontradas):
+            data = sessao_data['data']
+            publico = sessao_data['publico']
+            total_dia = publico['pcg'] + publico['com'] + publico['adv']
+            
+            ctk.CTkLabel(scroll_frame, text=data).grid(row=idx + 1, column=0, padx=10)
+            ctk.CTkLabel(scroll_frame, text=str(publico['pcg'])).grid(row=idx + 1, column=1, padx=10)
+            ctk.CTkLabel(scroll_frame, text=str(publico['com'])).grid(row=idx + 1, column=2, padx=10)
+            ctk.CTkLabel(scroll_frame, text=str(publico['adv'])).grid(row=idx + 1, column=3, padx=10)
+            ctk.CTkLabel(scroll_frame, text=str(total_dia), font=self.FONTS["body_bold"]).grid(row=idx + 1, column=4, padx=10)
+
+        def salvar_sessoes_importadas():
+            sala = combo_sala.get()
+            if sala == "Selecione":
+                messagebox.showerror("Erro", "Por favor, selecione uma sala.", parent=win)
+                return
+
+            sessoes_salvas = 0
+            for sessao_data in sessoes_encontradas:
+                try:
+                    data_sessao_dt = datetime.strptime(sessao_data['data'], "%d/%m/%Y")
+                    publico = sessao_data['publico']
+                    
+                    sessao_para_salvar = {
+                        "Dia": DIAS_SEMANA_PT[data_sessao_dt.weekday()],
+                        "Data": data_sessao_dt.strftime("%d/%m/%Y"),
+                        "Nome_do_Evento": nome_evento,
+                        "Sala": sala,
+                        "Publico_PCG": publico['pcg'],
+                        "Publico_Comerciario": publico['com'],
+                        "Publico_Adversos": publico['adv'],
+                        "PCG_COM": publico['pcg'] + publico['com'],
+                        "Total": publico['pcg'] + publico['com'] + publico['adv'],
+                        "Observacoes": "Importado via PDF"
+                    }
+                    self.db.adicionar_sessao(sessao_para_salvar)
+                    sessoes_salvas += 1
+                except Exception as e:
+                    messagebox.showerror("Erro ao Salvar", f"Ocorreu um erro ao salvar a sessão do dia {sessao_data['data']}:\n{e}", parent=win)
+                    return 
+            
+            messagebox.showinfo("Sucesso", f"{sessoes_salvas} sessões foram importadas com sucesso!", parent=win)
+            win.destroy()
+            self.filtro_nome.delete(0, 'end')
+            self.filtro_nome.insert(0, nome_evento)
+            self.tab_view.set("Histórico de Sessões")
+            self.atualizar_historico()
+
+        ctk.CTkButton(win, text="Salvar Todas as Sessões no Sistema", command=salvar_sessoes_importadas, height=40, font=self.FONTS["header"]).pack(pady=20, padx=20, fill="x")
+
+    #======================================================================
+    #============== FIM DOS MÉTODOS DE IMPORTAÇÃO DE PDF ==================
+    #======================================================================
 
     def criar_aba_registro(self):
         frame = self.tab_view.tab("Registrar Evento")
@@ -176,7 +390,14 @@ class App(ctk.CTk):
         checkbox_container.pack(pady=5)
         for dia in self.vars_dias:
             ctk.CTkCheckBox(checkbox_container, text=dia, variable=self.vars_dias[dia], font=self.FONTS["body"], fg_color=self.COLORS["primary"], hover_color=self.COLORS["primary_hover"]).pack(side="left", padx=10)
-        ctk.CTkButton(frame, text="Definir Públicos por Sessão", height=45, font=self.FONTS["header"], corner_radius=8, command=self.abrir_janela_edicao_publico, image=self.ICONS.get("add"), fg_color=self.COLORS["primary"], hover_color=self.COLORS["primary_hover"]).pack(pady=20)
+        
+        botoes_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        botoes_frame.pack(pady=20)
+        ctk.CTkButton(botoes_frame, text="Definir Públicos por Sessão", height=45, font=self.FONTS["header"], 
+                      corner_radius=8, command=self.abrir_janela_edicao_publico, image=self.ICONS.get("add"), 
+                      fg_color=self.COLORS["primary"], hover_color=self.COLORS["primary_hover"]).pack(side="left", padx=10)
+        ctk.CTkButton(botoes_frame, text="Importar de PDF", height=45, font=self.FONTS["header"], 
+                      corner_radius=8, command=self.importar_de_pdf, image=self.ICONS.get("pdf")).pack(side="left", padx=10)
 
     def abrir_janela_edicao_publico(self):
         try:
@@ -265,17 +486,13 @@ class App(ctk.CTk):
 
             self.update_status(f"{len(sessoes_para_salvar)} sessões registradas com sucesso.")
             win_edicao.destroy()
-
-            # Limpa filtros e mostra apenas o evento recém-cadastrado
             self.filtro_sala.set("Todas as Salas")
             self.filtro_ano.set("")
             self.filtro_nome.delete(0, 'end')
             self.filtro_nome.insert(0, nome)
-
             self.tab_view.set("Histórico de Sessões")
             self.atualizar_historico()
             self.limpar_campos_registro()
-
         except ValueError:
             messagebox.showerror("Erro de Valor", "Os campos de público devem ser números inteiros.", parent=win_edicao)
         except Exception as e:
@@ -334,7 +551,6 @@ class App(ctk.CTk):
         self.historico_scroll = ctk.CTkScrollableFrame(frame, label_text="Resultados da Busca", label_font=self.FONTS["header"], fg_color=self.COLORS["frame"], corner_radius=10)
         self.historico_scroll.grid(row=1, column=0, padx=10, pady=10, sticky="nsew")
         
-        # CORREÇÃO: Usa .grid() para a mensagem inicial
         label_inicial = ctk.CTkLabel(self.historico_scroll, text="Use os filtros acima e clique em 'Pesquisar' para buscar um evento.", font=self.FONTS["body"])
         label_inicial.grid(row=0, column=0, pady=20, padx=20)
 
@@ -342,7 +558,6 @@ class App(ctk.CTk):
     def limpar_resultados_historico(self):
         for w in self.historico_scroll.winfo_children():
             w.destroy()
-        # CORREÇÃO: Usa .grid() para a mensagem de limpeza
         label_limpo = ctk.CTkLabel(self.historico_scroll, text="Use os filtros e clique em 'Pesquisar' para buscar.", font=self.FONTS["body"])
         label_limpo.grid(row=0, column=0, pady=20)
         self.combo_excluir_evento.configure(values=["Nenhum evento na busca"])
@@ -417,7 +632,7 @@ class App(ctk.CTk):
             if self.filtro_ano.cget("values") != [str(ano) for ano in anos_disponiveis]:
                 self.filtro_ano.configure(values=[str(ano) for ano in anos_disponiveis])
             if ano_selecionado_str not in [str(a) for a in anos_disponiveis]:
-                 self.filtro_ano.set(ano_selecionado_str if ano_selecionado_str else '')
+                    self.filtro_ano.set(ano_selecionado_str if ano_selecionado_str else '')
 
         if not df.empty:
             eventos_unicos = sorted(df["Nome do Evento"].unique())
@@ -428,7 +643,6 @@ class App(ctk.CTk):
             self.combo_excluir_evento.set("Nenhum evento encontrado")
 
         if df.empty:
-            # CORREÇÃO: Usa .grid() para a mensagem de "nenhum dado"
             label_vazio = ctk.CTkLabel(self.historico_scroll, text="Nenhum dado encontrado para os filtros selecionados.", font=self.FONTS["body"])
             label_vazio.grid(row=0, column=0, pady=20)
             return
@@ -622,7 +836,7 @@ class App(ctk.CTk):
         self.entry_ano2.pack(side="left", padx=5, pady=5)
         
         self.btn_gerar_grafico = ctk.CTkButton(filtros_frame, text="Gerar Gráficos", height=35, command=self.gerar_grafico, image=self.ICONS.get("charts"),
-                      fg_color=self.COLORS["primary"], hover_color=self.COLORS["primary_hover"])
+                               fg_color=self.COLORS["primary"], hover_color=self.COLORS["primary_hover"])
         self.btn_gerar_grafico.pack(side="left", padx=10, pady=5)
         
         ctk.CTkButton(filtros_frame, text="Exportar PDF", height=35, command=self.exportar_grafico_pdf, image=self.ICONS.get("pdf")).pack(side="left", padx=10, pady=5)
@@ -751,7 +965,7 @@ class App(ctk.CTk):
 
             for container in ax.containers:
                 ax.bar_label(container, labels=[f'{int(v)}' if v > 0 else '' for v in container.datavalues],
-                             color=self.COLORS["text"], fontsize=8, rotation=90, padding=5)
+                                     color=self.COLORS["text"], fontsize=8, rotation=90, padding=5)
 
             ax.set_title(f"Público por Sala/Mês - {ano}")
             ax.set_xlabel("Mês")
@@ -810,7 +1024,7 @@ class App(ctk.CTk):
                                       startangle=90, colors=colors, pctdistance=0.80,
                                       textprops={'color':"white", 'weight':"bold", 'fontsize':10})
                 leg = ax.legend(wedges, sala_tot.index, title="Salas", loc="center left", bbox_to_anchor=(1, 0, 0.5, 1),
-                                     labelcolor=self.COLORS["text"], facecolor=self.COLORS["frame"], edgecolor='none')
+                                      labelcolor=self.COLORS["text"], facecolor=self.COLORS["frame"], edgecolor='none')
                 leg.get_title().set_color(self.COLORS["text"])
             ax.set_title(f"Distribuição por Sala {ano}")
 
